@@ -36,7 +36,6 @@ def _parse_ld_json(soup: BeautifulSoup) -> List[Any]:
             continue
         except Exception:
             pass
-        # Если внутри несколько JSON-объектов — разбиваем и пытаемся парсить
         for chunk in re.split(r'\n(?=\s*[{[]\s*)', text):
             try:
                 data = json.loads(chunk)
@@ -46,38 +45,19 @@ def _parse_ld_json(soup: BeautifulSoup) -> List[Any]:
     return results
 
 
-def _find_publish_date_in_scripts(soup: BeautifulSoup) -> Optional[str]:
-    for script in soup.find_all('script'):
-        text = script.string or script.get_text() or ''
-        if not text:
-            continue
-        m = re.search(r'["\']publishDate["\']\s*:\s*["\']([^"\']+)["\']', text)
-        if m:
-            return m.group(1)
-        m2 = ISO_DT_RE.search(text)
-        if m2:
-            return m2.group(0)
-    time_tag = soup.find('time')
-    if time_tag:
-        dt = time_tag.get('datetime') or time_tag.get('data-datetime')
-        if dt:
-            return dt
-    return None
-
-
 def _extract_info_slice_fields(soup: BeautifulSoup) -> List[str]:
     results = []
-    # По классам, содержащим ключевые слова
     for el in soup.find_all(class_=lambda c: c and (
             'info-slice' in c.lower() or
             'infoslice' in c.lower() or
             'infoslicelist' in c.lower() or
-            'infoslicelistitem' in c.lower()
+            'infoslicelistitem' in c.lower() or
+            'infoslice' in c.lower()
     )):
         text = ' '.join(el.stripped_strings)
         if text:
             results.append(text)
-    # Если ничего не найдено — попытка по data-/aria-атрибутам
+
     if not results:
         candidates = soup.select('[data-testid*="info"], [data-qa*="info"], [aria-label*="Info"], [aria-label*="info"]')
         for c in candidates:
@@ -86,6 +66,86 @@ def _extract_info_slice_fields(soup: BeautifulSoup) -> List[str]:
                 results.append(t)
     # Убираем дубликаты, сохраняем порядок
     return list(dict.fromkeys(results))
+
+
+def _extract_author_names(soup: BeautifulSoup) -> List[str]:
+    authors: List[str] = []
+
+
+    meta_author = _get_meta_content(soup,
+                                    [{'name': 'author'}, {'property': 'article:author'}, {'name': 'parsely-author'}])
+    if meta_author:
+
+        for part in re.split(r'\s*[;,/]\s*|\s+and\s+', meta_author):
+            name = part.strip()
+            if name:
+                authors.append(name)
+
+    ld = _parse_ld_json(soup)
+    for item in ld:
+        if isinstance(item, dict) and item.get('author'):
+            a = item.get('author')
+
+            if isinstance(a, str):
+                authors.append(a.strip())
+            elif isinstance(a, dict):
+
+                name = a.get('name') or a.get('author') or None
+                if name:
+                    authors.append(str(name).strip())
+            elif isinstance(a, list):
+                for elt in a:
+                    if isinstance(elt, str):
+                        authors.append(elt.strip())
+                    elif isinstance(elt, dict):
+                        name = elt.get('name') or elt.get('author')
+                        if name:
+                            authors.append(str(name).strip())
+
+
+    for el in soup.find_all(attrs={'itemprop': 'author'}):
+
+        text = ' '.join(el.stripped_strings)
+        if text:
+            authors.append(text.strip())
+    # По классам и атрибутам rel
+    for el in soup.find_all(lambda tag: (
+                                                tag.get('rel') and ('author' in ' '.join(tag.get('rel')))) or
+                                        (tag.has_attr('class') and any(
+                                            'author' in c.lower() or 'byline' in c.lower() or 'contributor' in c.lower()
+                                            for c in tag.get('class')))
+                            ):
+        txt = ' '.join(el.stripped_strings)
+        if txt:
+            authors.append(txt.strip())
+
+    for sel in ['a[rel="author"]', '.byline', '.article-author', '.author-name', '.author']:
+        for el in soup.select(sel):
+            txt = ' '.join(el.stripped_strings)
+            if txt:
+                authors.append(txt.strip())
+
+    for el in soup.find_all(['p', 'div', 'span', 'a', 'li']):
+        txt = el.get_text(strip=True)
+        if not txt or len(txt) > 200:
+            continue
+
+        m = re.match(r'^(By|by)\s+([A-Z][\w\-\.\s]+)$', txt)
+        if m:
+            authors.append(m.group(2).strip())
+            continue
+
+        m2 = re.match(r'^(Автор[:\-–]\s*)(.+)$', txt, flags=re.I)
+        if m2:
+            authors.append(m2.group(2).strip())
+            continue
+
+    clean: List[str] = []
+    for a in authors:
+        name = re.sub(r'\s+', ' ', a).strip()
+        if name and name not in clean:
+            clean.append(name)
+    return clean
 
 
 # -----------------------
@@ -102,14 +162,13 @@ def extract_fields_from_html(html: str) -> Dict[str, Any]:
         h1 = soup.find('h1')
         if h1:
             name = h1.get_text(strip=True)
-    # ld+json
+    # ld+json — дополнительная попытка
     ld = _parse_ld_json(soup)
     for item in ld:
-        if isinstance(item, dict):
+        if isinstance(item, dict) and not name:
             if item.get('name'):
-                name = name or item.get('name')
+                name = item.get('name')
 
-    # description: meta description / og:description / parsely
     description = _get_meta_content(soup, [{'name': 'description'}, {'property': 'og:description'},
                                            {'name': 'parsely-metadata'}])
     if description and description.strip().startswith('{') and 'description' in description:
@@ -148,30 +207,21 @@ def extract_fields_from_html(html: str) -> Dict[str, Any]:
             else:
                 review_body = article.get_text(separator='\n', strip=True)
 
-    publish_date = _get_meta_content(soup, [{'property': 'article:published_time'}, {'name': 'publishDate'},
-                                            {'name': 'parsely-post-pubdate'}])
-    if not publish_date:
-        for item in ld:
-            if isinstance(item, dict) and item.get('datePublished'):
-                publish_date = item.get('datePublished')
-                break
-    if not publish_date:
-        publish_date = _find_publish_date_in_scripts(soup)
-
+    # info slice
     info_slice_fields = _extract_info_slice_fields(soup)
+
+    # author names
+    author_names = _extract_author_names(soup)
 
     return {
         'name': name,
         'description': description,
+        'authorNames': author_names,
         'reviewBody': review_body,
-        'publishDate': publish_date,
         'infoSliceFields': info_slice_fields
     }
 
 
-# -----------------------
-# Запись всех полей в один файл (без заголовков и без publishDate)
-# -----------------------
 def write_single_cleaned_file(out_path: Path, fields: Dict[str, Any]):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open('w', encoding='utf-8') as f:
@@ -185,24 +235,30 @@ def write_single_cleaned_file(out_path: Path, fields: Dict[str, Any]):
             f.write(str(fields['description']).strip())
         f.write('\n\n')
 
+        # authorNames
+        authors = fields.get('authorNames') or []
+        if authors:
+            for a in authors:
+                f.write(a.strip() + '\n')
+        f.write('\n')
+
         # infoSliceFields
         items = fields.get('infoSliceFields') or []
         if items:
-            for i, it in enumerate(items):
-                # записываем каждую запись на новую строку
+            for it in items:
                 f.write(it.strip() + '\n')
         f.write('\n')
 
         # reviewBody
         if fields.get('reviewBody'):
             f.write(str(fields['reviewBody']).strip())
-        # конец файла
 
 
 # -----------------------
 # Обход папки pages
 # -----------------------
 def process_all_pages(pages_dir: Path, cleaned_dir: Path):
+
     if not pages_dir.exists() or not pages_dir.is_dir():
         print(f'Входная папка {pages_dir!s} не найдена. Поместите HTML-файлы в папку "{pages_dir}" и запустите снова.')
         return
@@ -213,7 +269,6 @@ def process_all_pages(pages_dir: Path, cleaned_dir: Path):
         return
 
     for file_path in files:
-        # читаем файл (utf-8 или fallback)
         try:
             try:
                 html = file_path.read_text(encoding='utf-8')
