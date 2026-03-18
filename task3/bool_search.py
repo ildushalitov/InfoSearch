@@ -3,7 +3,7 @@ import re
 from collections import defaultdict
 
 from spacy.cli import download
-download("en_core_web_sm")  # скачиваем модель если не скачана
+# download("en_core_web_sm")  # скачиваем модель если не скачана
 
 INDEX_FILE = 'inverted_index.txt'
 URL_FILE = '../task1/pages/index.txt'
